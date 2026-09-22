@@ -1,388 +1,515 @@
-"""
-YouTube.py — Compact YouTube platform for AloneMusic
-Original: TheAloneTeam/AloneMusic (GNU v3.0)
-"""
+import os
+import re
+import asyncio
+import aiohttp
+from pathlib import Path
+from py_yt import VideosSearch, Playlist
+from ArchonMusic import logger, config
+from ArchonMusic.helpers import Track, utils, FallenApi
 
-import asyncio, os, re, json, time, logging
-import urllib.parse
-from typing import Union
+API_URL = os.environ.get("SHRUTI_API_URL", "https://api01.shrutibots.site").rstrip("/")
+API_URLS = list(dict.fromkeys([
+    API_URL,
+    "https://api01.shrutibots.site",
+    "https://api.shrutibots.site",
+    "https://shrutibots.site",
+]))
+
+API_KEY = os.environ.get("SHRUTI_API_KEY", "ShrutiBotsfhGT4c09sFRRuQIB6yCG") ## Get This API KEY FROM TELEGRAM BOT USERNAME: @SHRUTIAPIBOT
+
+DOWNLOAD_DIR = "downloads"
 
 
-import yt_dlp
+def _youtube_id(value: str) -> str:
+    """Return a clean YouTube video id from an id or common YouTube URL."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    patterns = (
+        r"(?:v=|vi=)([A-Za-z0-9_-]{6,})",
+        r"youtu\.be/([A-Za-z0-9_-]{6,})",
+        r"youtube\.com/shorts/([A-Za-z0-9_-]{6,})",
+        r"youtube\.com/embed/([A-Za-z0-9_-]{6,})",
+        r"youtube\.com/live/([A-Za-z0-9_-]{6,})",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, value)
+        if m:
+            return m.group(1)
+    return value if re.fullmatch(r"[A-Za-z0-9_-]{6,}", value) else ""
 
-# ── Config ────────────────────────────────────────────────────
-API_URL = os.getenv("API_URL", "http://localhost:8000").rstrip("/")
-API_KEY = os.getenv("API_KEY", "riteshfreea6901be19d3f420aad766250")
 
-# ── Dynamic imports with graceful fallbacks ───────────────────
-try:
-    from pyrogram.enums import MessageEntityType
-    from pyrogram.types import Message
-except ImportError:
-    class MessageEntityType: URL = "url"; TEXT_LINK = "text_link"
-    class Message: pass
+async def _download_from_api(video_id: str, media_type: str, timeout: int) -> str | None:
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    ext = "mp4" if media_type == "video" else "mp3"
+    file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.{ext}")
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+        return file_path
 
-try:
-    from youtubesearchpython.__future__ import VideosSearch, Playlist
-except ImportError:
-    VideosSearch = None; Playlist = None
-
-try:
-    from AviaxMusic.utils.database import is_on_off
-except ImportError:
-    async def is_on_off(*a, **k): return True
-
-try:
-    from AviaxMusic.utils.formatters import time_to_seconds
-except ImportError:
-    def time_to_seconds(s):
-        if not s: return 0
+    for api_url in API_URLS:
         try:
-            p = list(map(int, s.split(":")))
-            return (p[0] * 3600 + p[1] * 60 + p[2]) if len(p) == 3 \
-                else (p[0] * 60 + p[1]) if len(p) == 2 else p[0]
-        except Exception: return 0
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{api_url}/download",
+                    params={"url": video_id, "type": media_type, "api_key": API_KEY},
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    with open(file_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(131072):
+                            if chunk:
+                                f.write(chunk)
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                return file_path
+        except Exception as e:
+            logger.warning(f"[YouTube.API] {api_url} {media_type} failed for {video_id}: {e!r}")
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+    return None
 
 
-# ── Utility helpers ───────────────────────────────────────────
-def extract_vidid(q):
-    if not q: return None
-    if re.match(r"^[a-zA-Z0-9_-]{11}$", q): return q
-    m = re.search(r'(?:youtube\.com/(?:[^/]+/.+/|(?:v|e(?:mbed)?)\/|shorts\/|.*[?&]v=)|youtu\.be\/)([^\ "&?/\s]{11})', q)
-    return m.group(1) if m else None
+async def download_song(link: str) -> str:
+    return await _download_from_api(_youtube_id(link), "audio", 300) if _youtube_id(link) else None
 
 
-async def check_file_size(link):
-    def _parse(f): return sum(x.get("filesize", 0) for x in f) if f else 0
-    async def _info():
-        p = await asyncio.create_subprocess_exec("yt-dlp", "-J", link,
-              stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, err = await p.communicate()
-        if p.returncode != 0:
-            print(f"Error:\n{err.decode()}"); return None
-        return json.loads(out.decode())
-    info = await _info()
-    if not info: return None
-    f = info.get("formats", [])
-    return _parse(f) if f else None
+async def download_video(link: str) -> str:
+    return await _download_from_api(_youtube_id(link), "video", 600) if _youtube_id(link) else None
 
 
-async def download_assistant(query, dl_type):
-    safe, ext = urllib.parse.quote(query), "mp3" if dl_type == "audio" else "mp4"
-    if API_KEY:
-        return f"{API_URL}/downloads/{API_KEY}/{safe}.{ext}"
-    return f"{API_URL}/downloads/stream?query={safe}&dl_type={dl_type}"
-
-
-# ── YouTubeAPI ────────────────────────────────────────────────
-class YouTubeAPI:
+class YouTube:
     def __init__(self):
         self.base = "https://www.youtube.com/watch?v="
-        self.listbase = "https://youtube.com/playlist?list="
-        self.regex = r"(?:youtube\.com|youtu\.be)"
-        self.status = "https://www.youtube.com/oembed?url="
-        self.reg = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-        self._client = None
-        self._recent_prefetches = {}
+        self.regex = re.compile(
+            r"(https?://)?(www\.|m\.|music\.)?"
+            r"(youtube\.com/(watch\?v=|shorts/|playlist\?list=)|youtu\.be/)"
+            r"([A-Za-z0-9_-]{11}|PL[A-Za-z0-9_-]+)([&?][^\s]*)?"
+        )
+        self.cookie_dir = "AloneX/cookies"
+        self.fallen_api = FallenApi(API_URL, API_KEY, retries=2, timeout=30)
 
-    async def get_client(self):
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0), follow_redirects=True)
-        return self._client
+    def valid(self, url: str) -> bool:
+        return bool(re.match(self.regex, url))
 
-    async def exists(self, link, videoid: Union[bool, str] = None):
-        if videoid: link = self.base + link
-        return bool(re.search(self.regex, link))
-
-    async def url(self, message_1):
-        msgs = [message_1] + ([message_1.reply_to_message] if message_1.reply_to_message else [])
-        for m in msgs:
-            if getattr(m, "entities", None):
-                for e in m.entities:
-                    if e.type == MessageEntityType.URL:
-                        t = m.text or m.caption
-                        return t[e.offset:e.offset + e.length]
-            elif getattr(m, "caption_entities", None):
-                for e in m.caption_entities:
-                    if e.type == MessageEntityType.TEXT_LINK:
-                        return e.url
-        return None
-
-    def _clean_link(self, link):
-        if not link: return ""
-        link = str(link)
-        if "&" in link: link = link.split("&")[0]
-        if "?si=" in link: link = link.split("?si=")[0]
-        elif "&si=" in link: link = link.split("&si=")[0]
-        return link
-
-    async def _fetch_details(self, link):
-        link = self._clean_link(link)
-        params = {"link": link}
-        if API_KEY: params["api_key"] = API_KEY
+    async def search(self, query: str, m_id: int, video: bool = False) -> Track | None:
         try:
-            r = await (await self.get_client()).get(f"{API_URL}/details", params=params)
-            if r.status_code == 200: return r.json()
-        except Exception as e:
-            logging.warning(f"Error fetching details from API: {e}")
-        return None
-
-    async def details(self, link, videoid=None):
-        if videoid: link = self.base + link
-        link = self._clean_link(link)
-        if API_URL:
-            d = await self._fetch_details(link)
-            if d: return d.get("title"), d.get("duration_min"), d.get("duration_sec", 0), d.get("thumbnail"), d.get("vidid")
-        if VideosSearch:
-            try:
-                res = await (VideosSearch(link, limit=1)).next()
-                if res and res.get("result"):
-                    x = res["result"][0]
-                    return x["title"], x["duration"], int(time_to_seconds(x["duration"])) if x["duration"] not in (None, "None") else 0, x["thumbnails"][0]["url"].split("?")[0], x["id"]
-            except Exception as e: logging.warning(f"Local VideosSearch fallback failed in details: {e}")
-        return None, None, 0, None, None
-
-    async def title(self, link, videoid=None):
-        if videoid: link = self.base + link
-        link = self._clean_link(link)
-        if API_URL:
-            d = await self._fetch_details(link)
-            if d and d.get("title"): return d["title"]
-        if VideosSearch:
-            try:
-                res = await (VideosSearch(link, limit=1)).next()
-                if res and res.get("result"): return res["result"][0]["title"]
-            except Exception as e: logging.warning(f"Local VideosSearch fallback failed in title: {e}")
-        return None
-
-    async def duration(self, link, videoid=None):
-        if videoid: link = self.base + link
-        link = self._clean_link(link)
-        if API_URL:
-            d = await self._fetch_details(link)
-            if d and d.get("duration_min"): return d["duration_min"]
-        if VideosSearch:
-            try:
-                res = await (VideosSearch(link, limit=1)).next()
-                if res and res.get("result"): return res["result"][0]["duration"]
-            except Exception as e: logging.warning(f"Local VideosSearch fallback failed in duration: {e}")
-        return None
-
-    async def thumbnail(self, link, videoid=None):
-        if videoid: link = self.base + link
-        link = self._clean_link(link)
-        if API_URL:
-            d = await self._fetch_details(link)
-            if d and d.get("thumbnail"): return d["thumbnail"]
-        if VideosSearch:
-            try:
-                res = await (VideosSearch(link, limit=1)).next()
-                if res and res.get("result"): return res["result"][0]["thumbnails"][0]["url"].split("?")[0]
-            except Exception as e: logging.warning(f"Local VideosSearch fallback failed in thumbnail: {e}")
-        return None
-
-    async def video(self, link, videoid=None):
-        if videoid: link = self.base + link
-        link = self._clean_link(link)
-        try:
-            res = await self.download(link, None, video=True)
-            if res and isinstance(res, tuple) and res[0]: return 1, res[0]
-        except Exception as e: logging.warning(f"Downloading API video locally failed: {e}")
-        try:
-            p = await asyncio.create_subprocess_exec("yt-dlp", "-g", "-f", "best[height<=?720][width<=?1280]", link,
-                  stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            out, err = await p.communicate()
-            return (1, out.decode().split("\n")[0]) if out else (0, err.decode())
-        except Exception as e: return 0, str(e)
-
-    async def playlist(self, link, limit, user_id, videoid=None):
-        if videoid: link = self.listbase + link
-        link = self._clean_link(link)
-        params = {"link": link, "limit": limit}
-        if API_KEY: params["api_key"] = API_KEY
-        try:
-            r = await (await self.get_client()).get(f"{API_URL}/playlist", params=params)
-            if r.status_code == 200: return r.json().get("videos")
-            LOGGER(__name__).error(f"API Playlist Error ({r.status_code}): {r.text}")
-        except Exception as e: LOGGER(__name__).error(f"Error fetching playlist from API: {e}")
-        return None
-
-    async def track(self, link, videoid=None):
-        if videoid: link = self.base + link
-        link = self._clean_link(link)
-        if API_URL:
-            d = await self._fetch_details(link)
-            if d:
-                return ({"title": d.get("title"), "link": d.get("link"), "vidid": d.get("vidid"),
-                         "duration_min": d.get("duration_min"), "thumb": d.get("thumbnail")}, d.get("vidid"))
-        if VideosSearch:
-            try:
-                res = await (VideosSearch(link, limit=1)).next()
-                if res and res.get("result"):
-                    x = res["result"][0]
-                    return ({"title": x["title"], "link": x["link"], "vidid": x["id"], "duration_min": x["duration"],
-                             "thumb": x["thumbnails"][0]["url"].split("?")[0]}, x["id"])
-            except Exception as e: logging.warning(f"Local track fallback failed: {e}")
-        return None, None
-
-    async def formats(self, link, videoid=None):
-        if videoid: link = self.base + link
-        link = self._clean_link(link)
-        if API_URL:
-            params = {"link": link}
-            if API_KEY: params["api_key"] = API_KEY
-            try:
-                r = await (await self.get_client()).get(f"{API_URL}/formats", params=params)
-                if r.status_code == 200:
-                    f = r.json().get("formats", [])
-                    for x in f: x["yturl"] = link
-                    return f, link
-            except Exception as e: logging.warning(f"Error fetching formats from API: {e}")
-        def _extract():
-            with yt_dlp.YoutubeDL({"quiet": True}) as y: return y.extract_info(link, download=False)
-        try:
-            r = await asyncio.to_thread(_extract)
-            out = []
-            for f in r.get("formats", []):
+            video_id = _youtube_id(query) if self.valid(query) else ""
+            if video_id:
+                # Direct URL: never ask yt-dlp/YouTube for metadata.
+                # YouTube can block cloud IPs with an anti-bot challenge even
+                # before media download. oEmbed is metadata-only and needs no
+                # cookies; if it is unavailable we still keep the supplied ID
+                # and let the download API handle the media.
+                data = {}
                 try:
-                    if "dash" not in str(f.get("format", "")).lower():
-                        out.append({"format": f.get("format"), "filesize": f.get("filesize"), "format_id": f.get("format_id"),
-                                    "ext": f.get("ext"), "format_note": f.get("format_note"), "yturl": link})
-                except Exception: continue
-            return out, link
-        except Exception as e: logging.warning(f"Formats extraction failed: {e}"); return [], link
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            "https://www.youtube.com/oembed",
+                            params={
+                                "url": f"https://www.youtube.com/watch?v={video_id}",
+                                "format": "json",
+                            },
+                            timeout=aiohttp.ClientTimeout(total=8),
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.json(content_type=None)
+                except Exception as e:
+                    logger.warning(f"[YouTube.oEmbed] metadata unavailable for {video_id}: {e!r}")
 
-    async def slider(self, link, query_type, videoid=None):
-        if videoid: link = self.base + link
-        link = self._clean_link(link)
-        if API_URL:
-            params = {"query": link, "limit": 10}
-            if API_KEY: params["api_key"] = API_KEY
-            try:
-                r = await (await self.get_client()).get(f"{API_URL}/search", params=params)
-                if r.status_code == 200:
-                    result = r.json().get("result", [])
-                    if result and len(result) > query_type:
-                        t = result[query_type]
-                        return t["title"], t["duration"], t["thumbnails"][0]["url"].split("?")[0] if t.get("thumbnails") else None, t["id"]
-            except Exception as e: logging.warning(f"Error in slider/search from API: {e}")
-        if VideosSearch:
-            try:
-                res = await (VideosSearch(link, limit=10)).next()
-                result = res.get("result")
-                if result and len(result) > query_type:
-                    t = result[query_type]
-                    return t["title"], t["duration"], t["thumbnails"][0]["url"].split("?")[0], t["id"]
-            except Exception as e: logging.warning(f"Local slider fallback failed: {e}")
-        return None, None, None, None
+                duration_sec = 0
+                thumb = data.get("thumbnail_url") or None
+                channel = data.get("author_name") or "YouTube"
+                title = data.get("title") or f"YouTube {video_id}"
+                track = Track(
+                    id=video_id, channel_name=channel, duration=self._format_duration(duration_sec),
+                    duration_sec=duration_sec, message_id=m_id, title=title, thumbnail=thumb,
+                    url=f"https://www.youtube.com/watch?v={video_id}",
+                    view_count=str(data.get("view_count") or ""), video=video,
+                )
+                track.language = self._language_key(title, channel)
+                return track
 
-    async def prefetch(self, link, video=False):
-        if not API_URL: return False
-        dl_type = "video" if video else "audio"
-        link = self._clean_link(link)
-        now = time.time()
-        vidid = extract_vidid(link) or link
-        ck = f"{vidid}_{dl_type}"
-        if ck in self._recent_prefetches and now - self._recent_prefetches[ck] < 30: return True
-        self._recent_prefetches[ck] = now
-        if len(self._recent_prefetches) > 100:
-            self._recent_prefetches = {k: v for k, v in self._recent_prefetches.items() if now - v < 300}
-        params = {"query": link, "dl_type": dl_type, "prefetch": "true"}
-        if API_KEY: params["api_key"] = API_KEY
+            _search = VideosSearch(query, limit=1)
+            results = await _search.next()
+            if results and results.get("result"):
+                data = results["result"][0] or {}
+                channel = data.get("channel") or {}
+                thumbnails = data.get("thumbnails") or []
+                thumb_url = ((thumbnails[-1] or {}).get("url") or "").split("?", 1)[0] if thumbnails else ""
+                detected_language = self._language_key(data.get("title", ""), channel.get("name", ""))
+                if detected_language == "unknown":
+                    detected_language = self._language_key(query, "")
+                track = Track(
+                    id=data.get("id"), channel_name=channel.get("name") or "YouTube",
+                    duration=data.get("duration"), duration_sec=utils.to_seconds(data.get("duration")) if data.get("duration") else 0,
+                    message_id=m_id, title=data.get("title"), thumbnail=thumb_url or None,
+                    url=(data.get("link") or "").split("&list=")[0],
+                    view_count=(data.get("viewCount") or {}).get("short") if isinstance(data.get("viewCount"), dict) else str(data.get("viewCount") or ""),
+                    video=video,
+                )
+                track.language = detected_language
+                return track
+        except Exception as e:
+            logger.error(f"Search error: {e}")
+        return None
+
+    async def playlist(self, limit: int, user: str, url: str, video: bool) -> list[Track]:
+        tracks = []
         try:
-            await (await self.get_client()).get(f"{API_URL}/download", params=params)
-            return True
-        except Exception as e: logging.warning(f"Prefetch failed for {link}: {e}")
-        return False
+            plist = await Playlist.get(url)
+            for data in plist.get("videos", [])[:limit]:
+                track = Track(
+                    id=data.get("id"),
+                    channel_name=data.get("channel", {}).get("name", ""),
+                    duration=data.get("duration"),
+                    duration_sec=utils.to_seconds(data.get("duration")) if data.get("duration") else 0,
+                    title=data.get("title"),
+                    thumbnail=thumb_url or None,
+                    url=data.get("link").split("&list=")[0],
+                    user=user,
+                    view_count="",
+                    video=video,
+                )
+                track.language = self._language_key(data.get("title", ""), data.get("channel", {}).get("name", ""))
+                tracks.append(track)
+        except Exception as e:
+            logger.error(f"Playlist error: {e}")
+        return tracks
 
-    async def prefetch_queue(self, queries, video=False):
-        if not API_URL or not queries: return False
-        params = {}
-        if API_KEY: params["api_key"] = API_KEY
+    async def download(self, video_id: str, video: bool = False) -> str | None:
+        """Download media with two API paths; never use cookies.
+
+        Some API responses can be HTTP 200 without returning a usable file.
+        In that case fall back to the /api/track -> CDN/Telegram path.
+        """
+        video_id = _youtube_id(video_id)
+        if not video_id:
+            return None
+
+        # Primary downloader.
+        path = await (download_video(video_id) if video else download_song(video_id))
+        if path and os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+
+        # Secondary API fallback. Some hosted API endpoints return 404;
+        # keep trying but never let that prevent the local extractor fallback.
         try:
-            await (await self.get_client()).post(f"{API_URL}/prefetch_bulk",
-                  json={"queries": queries, "dl_type": "video" if video else "audio"}, params=params)
-            return True
-        except Exception as e: logging.warning(f"Bulk prefetch failed: {e}")
-        return False
+            path = await self.fallen_api.download_track(video_id, video=video)
+            if path and os.path.exists(path) and os.path.getsize(path) > 0:
+                return path
+        except Exception as e:
+            logger.warning(f"[YouTube.download] API fallback failed for {video_id}: {e!r}")
 
-    async def download(self, link, mystic, video=None, videoid=None, songaudio=None,
-                       songvideo=None, format_id=None, title=None):
-        if videoid: link = self.base + link
-        async def _dl_api(ql, dt, fp):
-            if not API_URL: return False
-            vidid = extract_vidid(ql) or ql
-            params = {"query": vidid, "dl_type": dt}
-            if API_KEY: params["api_key"] = API_KEY
-            os.makedirs(os.path.dirname(fp), exist_ok=True)
+        # Do not fall back to direct yt-dlp. On Heroku/Salesforce cloud IPs
+        # YouTube may return an anti-bot challenge; retrying with other player
+        # clients does not solve that reliably and would only spam the logs.
+        return None
+
+    def _format_duration(self, seconds: int) -> str:
+        seconds = max(int(seconds or 0), 0)
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m}:{s:02d}"
+
+    def _format_views(self, count) -> str:
+        if not count:
+            return ""
+        count = int(count)
+        if count >= 1_000_000:
+            return f"{count / 1_000_000:.1f}M views"
+        if count >= 1_000:
+            return f"{count / 1_000:.1f}K views"
+        return f"{count} views"
+
+    def _extract_related(self, video_id: str) -> dict | None:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": "in_playlist",
+            "skip_download": True,
+            "ignoreerrors": True,
+            "geo_bypass": True,
+            "socket_timeout": 10,
+            "retries": 1,
+            "extractor_retries": 1,
+            "extractor_args": {"youtube": {"player_client": ["android"]}},
+        }
+        url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    @staticmethod
+    def _is_non_music_title(title: str) -> bool:
+        """Reject podcast/episode/talk content from autoplay."""
+        t = (title or "").lower()
+        blocked = (
+            "episode", "podcast", "interview", "news", "talk show",
+            "full show", "full episode", "web series", "webseries",
+            "documentary", "trailer", "teaser", "reaction", "reaction video", "behind the scenes", "behind-the-scenes",
+        )
+        return any(word in t for word in blocked)
+
+    @staticmethod
+    def _language_key(title: str, channel: str = "") -> str:
+        """Classify autoplay language from title/channel without needing cookies.
+        Bhojpuri is checked before Hindi because both commonly use Devanagari.
+        """
+        t = f"{title or ''} {channel or ''}".lower()
+        if re.search(r"[\u0a00-\u0a7f]", t) or any(k in t for k in (
+            "punjabi", "panjabi", "bhangra", "gurmukhi", "punjabi song", "punjabi songs", "punjabi music",
+        )):
+            return "punjabi"
+        if any(k in t for k in (
+            "bhojpuri", "bhojpuriya", "bhojpuri song", "bhojpuri songs",
+            "purvanchal", "nirahua", "dinesh lal yadav", "khesari",
+            "khesari lal", "pawan singh", "rakesh mishra", "pramod premi",
+            "shilpi raj", "ritesh pandey", "ankush raja", "samar singh",
+            "neelkamal singh", "arvind akela kallu", "gunjan singh",
+            "priyanka singh", "kalpana", "chhotu chhaliya", "vikas jha",
+            "alok raj", "ashish yadav", "tuntun yadav", "raj bhai",
+            "aadishakti films", "wave music", "saregama hum bhojpuri",
+            "t-series hamaarbhojpuri", "hamaarbhojpuri", "enter10 music bhojpuri",
+            "bhojpuri hit", "bhojpuri lokgeet", "bhojpuri lok geet",
+            "bhojpuri dj", "bhojpuri status", "bhojpuri vivah", "bhojpuri vivah geet",
+            "golu gold", "rajesh khushdil", "vikas bedardi", "arjun rasiya",
+        )):
+            return "bhojpuri"
+        # Common Bhojpuri vocabulary is often present even when YouTube
+        # omits the word "Bhojpuri" from the title. Keep it out of Hindi.
+        bhojpuri_words = (
+            "गवनवा", "सईयां", "सईयाँ", "सइयां", "सइयाँ", "बलमुआ",
+            "बलमा", "पिया जी", "पियवा", "भतार", "लईका", "लइका",
+            "करेजा", "रउआ", "तोहरा", "हमरा", "हमार", "तोहार",
+            "बाड़े", "बानी", "बाड़ू", "बाड़ू", "निरहुआ", "खेसारी",
+            "पवन सिंह", "शिल्पी राज", "रउरा", "रउआ के", "हमनी", "तोहसे",
+            "तोहरा बिना", "हमरा बिना", "सईया", "सईयाँ", "बलम", "बबुआ",
+            "लइकी", "लईकी", "चोली", "साड़ी", "सजनी",
+        )
+        if any(k in t for k in bhojpuri_words):
+            return "bhojpuri"
+        # Devanagari without Bhojpuri markers is treated as Hindi.
+        if re.search(r"[\u0900-\u097f]", t) or any(k in t for k in (
+            "hindi", "bollywood", "hindustani", "hindi song", "hindi songs", "hindi music", "bollywood songs",
+            "t-series", "saregama music", "tips official", "zee music company",
+            "sony music india", "speed records", "punjabi song", "punjabi songs",
+        )):
+            return "hindi"
+        return "unknown"
+
+    @staticmethod
+    def _movie_key(title: str) -> str:
+        """Get a lightweight movie/source key from common YouTube song titles."""
+        t = re.sub(r"\s+", " ", (title or "").lower()).strip()
+        # Common formats: Song - Movie, Song | Movie, Song (Movie).
+        parts = re.split(r"\s+[|–—-]\s+|\s*\|\s*", t)
+        if len(parts) > 1:
+            candidate = parts[-1].strip()
+        else:
+            m = re.search(r"\bfrom\s+(.+)$", t)
+            candidate = m.group(1).strip() if m else ""
+            if not candidate:
+                m = re.search(r"\(([^()]*)\)\s*$", t)
+                candidate = m.group(1).strip() if m else ""
+        candidate = re.sub(r"[^a-z0-9 ]+", " ", candidate)
+        candidate = re.sub(r"\b(official|video|audio|song|lyrics|lyric|hd|4k)\b", " ", candidate)
+        return re.sub(r"\s+", " ", candidate).strip()
+
+    async def _related_from_mix(
+        self, video_id: str, played: set[str], movie_history: set[str] | None = None,
+        language: str = "unknown"
+    ) -> Track | None:
+        loop = asyncio.get_event_loop()
+        try:
+            info = await asyncio.wait_for(
+                loop.run_in_executor(None, self._extract_related, video_id),
+                timeout=20,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[Autoplay] Mix fetch timed out for {video_id}.")
+            return None
+        except Exception as e:
+            logger.error(f"[Autoplay] Mix fetch failed for {video_id}: {e}")
+            return None
+
+        entries = (info or {}).get("entries") or []
+        for entry in entries:
+            if not entry:
+                continue
+
+            eid = entry.get("id")
+            if not eid or eid in played:
+                continue
+
+            title = entry.get("title") or "Unknown"
+            if title.lower() in ("[deleted video]", "[private video]"):
+                continue
+            if self._is_non_music_title(title):
+                continue
+            candidate_language = self._language_key(title, entry.get("channel") or entry.get("uploader") or "")
+            if language != "unknown" and candidate_language != language:
+                continue
+            movie_key = self._movie_key(title)
+            if movie_key and movie_history and movie_key in movie_history:
+                continue
+
+            duration = int(entry.get("duration") or 0)
+            if duration <= 0 or duration > config.DURATION_LIMIT:
+                continue
+
+            thumbs = entry.get("thumbnails") or []
+            thumbnail = thumbs[-1]["url"].split("?")[0] if thumbs else None
+
+            track = Track(
+                id=eid,
+                channel_name=entry.get("channel") or entry.get("uploader") or "YouTube",
+                duration=self._format_duration(duration),
+                duration_sec=duration,
+                title=title,
+                thumbnail=thumbnail,
+                url=f"https://www.youtube.com/watch?v={eid}",
+                view_count=self._format_views(entry.get("view_count")),
+                video=False,
+            )
+            track.language = candidate_language
+            return track
+
+        return None
+
+    async def _related_from_search(
+        self, current: Track, played: set[str], movie_history: set[str] | None = None,
+        language: str = "unknown"
+    ) -> Track | None:
+        """Fallback used when YouTube blocks the mix-playlist scrape (common on
+        server/cloud IPs without cookies). Reuses the same search backend that
+        already powers /play, so it works wherever normal search works."""
+        # A direct YouTube link can arrive without a language label. In that
+        # case infer it once from the current title/channel before searching.
+        if language == "unknown":
+            language = self._language_key(
+                getattr(current, "title", ""), getattr(current, "channel_name", "")
+            )
+        language_hint = {
+            "hindi": "Hindi Bollywood songs old new",
+            "bhojpuri": "Bhojpuri songs old new",
+            "punjabi": "Punjabi songs old new",
+        }.get(language, "songs")
+        queries = []
+        if current.channel_name:
+            # Keep the language locked even when YouTube search returns mixed results.
+            queries.append(f"{current.channel_name} {language_hint} official song")
+            queries.append(f"{current.channel_name} {language_hint}")
+        if current.title:
+            queries.append(f"{current.title} {language_hint}")
+        # Always include a language-only pool so old/new songs are not limited
+        # to the current artist/channel. Candidate language is still checked below.
+        queries.append(language_hint)
+        if language == "hindi":
+            queries.append("Hindi songs 90s 2000s 2010s latest Bollywood")
+        elif language == "bhojpuri":
+            queries.append("Bhojpuri old new hit songs")
+        elif language == "punjabi":
+            queries.append("Punjabi old new hit songs")
+
+        for query in queries:
             try:
-                async with httpx.AsyncClient(timeout=600.0, follow_redirects=True) as c:
-                    async with c.stream("GET", f"{API_URL}/download", params=params) as r:
-                        if r.status_code != 200: return False
-                        with open(fp, "wb") as f:
-                            async for chunk in r.aiter_bytes(131072): f.write(chunk)
-                return os.path.exists(fp) and os.path.getsize(fp) > 0
+                _search = VideosSearch(query, limit=8)
+                results = await _search.next()
             except Exception as e:
-                logging.warning(f"API download failed for {vidid}: {e}")
-                if os.path.exists(fp):
-                    try: os.remove(fp)
-                    except Exception: pass
-                return False
-        if API_URL:
-            dt = "video" if (video or songvideo) else "audio"
-            link = self._clean_link(link)
-            vidid = extract_vidid(link) or link
-            ext = "mp4" if dt == "video" else "mp3"
-            if songvideo:
-                fp = f"downloads/{title}.mp4"
-                if await _dl_api(link, "video", fp): return fp
-            elif songaudio:
-                fp = f"downloads/{title}.mp3"
-                if await _dl_api(link, "audio", fp): return fp
-            else:
-                fp = f"downloads/{vidid}.{ext}"
-                asyncio.create_task(self.prefetch(link, video=bool(dt == "video")))
-                if await _dl_api(link, dt, fp): return fp, True
-        loop = asyncio.get_running_loop()
-        _base_opts = {"geo_bypass": True, "nocheckcertificate": True, "quiet": True, "no_warnings": True}
-        def _audio_dl():
-            x = yt_dlp.YoutubeDL({**_base_opts, "format": "bestaudio/best", "outtmpl": "downloads/%(id)s.%(ext)s"})
-            info = x.extract_info(link, False); p = os.path.join("downloads", f"{info['id']}.{info['ext']}")
-            return p if os.path.exists(p) else x.download([link]) or p
-        def _video_dl():
-            x = yt_dlp.YoutubeDL({**_base_opts, "format": "(bestvideo[height<=?720][width<=?1280][ext=mp4])+(bestaudio[ext=m4a])",
-                                  "outtmpl": "downloads/%(id)s.%(ext)s"})
-            info = x.extract_info(link, False); p = os.path.join("downloads", f"{info['id']}.{info['ext']}")
-            return p if os.path.exists(p) else x.download([link]) or p
-        def _song_video_dl():
-            yt_dlp.YoutubeDL({**_base_opts, "format": f"{format_id}+140", "outtmpl": f"downloads/{title}",
-                              "prefer_ffmpeg": True, "merge_output_format": "mp4"}).download([link])
-        def _song_audio_dl():
-            yt_dlp.YoutubeDL({**_base_opts, "format": format_id, "outtmpl": f"downloads/{title}.%(ext)s",
-                              "prefer_ffmpeg": True,
-                              "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]}).download([link])
-        if songvideo:
-            await loop.run_in_executor(None, _song_video_dl); return f"downloads/{title}.mp4"
-        if songaudio:
-            await loop.run_in_executor(None, _song_audio_dl); return f"downloads/{title}.mp3"
-        if video:
-            if await is_on_off(1):
-                direct = True; df = await loop.run_in_executor(None, _video_dl)
-            else:
-                p = await asyncio.create_subprocess_exec("yt-dlp", "-g", "-f", "best[height<=?720][width<=?1280]", f"{link}",
-                      stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                out, err = await p.communicate()
-                if out: return out.decode().split("\n")[0], False
-                fs = await check_file_size(link)
-                if not fs: print("None file Size"); return
-                if fs / (1024 * 1024) > 250: print(f"File size {fs/(1024*1024):.2f} MB exceeds the 100MB limit."); return None
-                direct = True; df = await loop.run_in_executor(None, _video_dl)
-            return df, direct
-        return await loop.run_in_executor(None, _audio_dl), True
+                logger.error(f"[Autoplay] Search fallback failed for {query!r}: {e}")
+                continue
 
-    async def close(self):
-        if self._client and not self._client.is_closed: await self._client.aclose()
+            for data in (results or {}).get("result", []):
+                eid = data.get("id")
+                if not eid or eid in played:
+                    continue
 
+                title = data.get("title") or "Unknown"
+                if self._is_non_music_title(title):
+                    continue
+                candidate_channel = data.get("channel", {}).get("name") or ""
+                candidate_language = self._language_key(title, candidate_channel)
+                if language != "unknown" and candidate_language != language:
+                    continue
+                movie_key = self._movie_key(title)
+                if movie_key and movie_history and movie_key in movie_history:
+                    continue
 
-YouTube = YouTubeAPI()
-    
+                duration_str = data.get("duration")
+                duration_sec = utils.to_seconds(duration_str) if duration_str else 0
+                if not duration_sec or duration_sec > config.DURATION_LIMIT:
+                    continue
+
+                track = Track(
+                    id=eid,
+                    channel_name=data.get("channel", {}).get("name") or "YouTube",
+                    duration=duration_str,
+                    duration_sec=duration_sec,
+                    title=title,
+                    thumbnail=(data.get("thumbnails", [{}])[-1].get("url") or "").split("?")[0] or None,
+                    url=data.get("link"),
+                    view_count=(data.get("viewCount") or {}).get("short") if isinstance(data.get("viewCount"), dict) else str(data.get("viewCount") or ""),
+                    video=False,
+                )
+                track.language = candidate_language
+                return track
+
+        return None
+
+    async def get_related(
+        self, current: Track, played: list[str] | None = None,
+        movie_history: list[str] | None = None
+    ) -> Track | None:
+        """Fetch the next autoplay track, skipping anything already played in
+        this session. Tries YouTube's related mix first, falling back to a
+        text search (same backend as /play) if the mix is blocked or empty —
+        this is common on server/cloud IPs without YouTube cookies set."""
+        if not current or not current.id:
+            return None
+
+        played = set(played or [])
+        played.add(current.id)
+        movie_history = set(movie_history or [])
+        current_language = getattr(current, "language", "unknown") or self._language_key(
+            getattr(current, "title", ""), getattr(current, "channel_name", "")
+        )
+        current_movie = self._movie_key(getattr(current, "title", ""))
+        if current_movie:
+            movie_history.add(current_movie)
+
+        # Run the two lightweight discovery paths in parallel. On cloud IPs,
+        # YouTube's RD mix can be slow/blocked while VideosSearch is often
+        # available immediately. Whichever produces a valid unused track first
+        # wins, reducing the pause between songs.
+        mix_task = asyncio.create_task(
+            self._related_from_mix(current.id, played, movie_history, current_language)
+        )
+        search_task = asyncio.create_task(
+            self._related_from_search(current, played, movie_history, current_language)
+        )
+        try:
+            pending = {mix_task, search_task}
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    try:
+                        related = task.result()
+                    except Exception as e:
+                        logger.warning(f"[Autoplay] related lookup failed: {e!r}")
+                        related = None
+                    if related:
+                        for other in pending:
+                            other.cancel()
+                        return related
+            logger.warning(f"[Autoplay] No related track found for {current.id}.")
+            return None
+        finally:
+            for task in (mix_task, search_task):
+                if not task.done():
+                    task.cancel()
