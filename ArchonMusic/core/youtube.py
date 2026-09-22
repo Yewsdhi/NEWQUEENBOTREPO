@@ -7,7 +7,7 @@ import asyncio, os, re, json, time, logging
 import urllib.parse
 from typing import Union
 
-import httpx
+
 import yt_dlp
 
 # ── Config ────────────────────────────────────────────────────
