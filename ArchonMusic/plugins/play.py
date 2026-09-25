@@ -1,11 +1,5 @@
 #
-# Copyright (C) 2025-present by TheAloneTeam@Github, < https://github.com/TheAloneTeam >.
-#
-# This file is part of < https://github.com/TheAloneTeam/KartikMusic > project,
-# and is released under the "MIT License".
-# Please see < https://github.com/TheAloneTeam/KartikMusic/blob/master/LICENSE >
-#
-# All rights reserved.
+# ArchonMusic/plugins/play.py
 #
 
 from pathlib import Path
@@ -22,8 +16,7 @@ def playlist_to_queue(chat_id: int, tracks: list) -> str:
     for track in tracks:
         pos = queue.add(chat_id, track)
         text += f"<b>{pos}.</b> {track.title}\n"
-    text = text[:1948] + "</blockquote>"
-    return text
+    return text[:1948] + "</blockquote>"
 
 
 @app.on_message(
@@ -57,8 +50,12 @@ async def play_hndlr(
     elif url:
         if "playlist" in url:
             await sent.edit_text(m.lang["playlist_fetch"])
-            tracks = await yt.playlist(config.PLAYLIST_LIMIT, mention, url, video)
-
+            tracks = await yt.playlist(
+                config.PLAYLIST_LIMIT,
+                mention,
+                url,
+                video,
+            )
             if not tracks:
                 return await sent.edit_text(m.lang["playlist_error"])
 
@@ -84,6 +81,35 @@ async def play_hndlr(
     if not file:
         return await sent.edit_text(m.lang["play_usage"])
 
+    # Normalize older dict-based media objects.
+    if isinstance(file, dict):
+        file = type("MediaResult", (dict,), {
+            "__getattr__": lambda self, name: self[name],
+            "__setattr__": lambda self, name, value: self.__setitem__(name, value),
+        })(file)
+
+    file.id = getattr(file, "id", None) or getattr(file, "vidid", None)
+    file.url = getattr(file, "url", None) or getattr(
+        file, "link", f"https://www.youtube.com/watch?v={file.id}"
+    )
+    file.duration = getattr(file, "duration", None) or getattr(
+        file, "duration_min", "0:00"
+    )
+    file.duration_sec = getattr(file, "duration_sec", None)
+    if file.duration_sec is None:
+        try:
+            parts = [int(x) for x in str(file.duration).split(":")]
+            if len(parts) == 3:
+                file.duration_sec = parts[0] * 3600 + parts[1] * 60 + parts[2]
+            elif len(parts) == 2:
+                file.duration_sec = parts[0] * 60 + parts[1]
+            else:
+                file.duration_sec = parts[0]
+        except Exception:
+            file.duration_sec = 0
+
+    file.file_path = getattr(file, "file_path", None)
+
     if file.duration_sec > config.DURATION_LIMIT:
         return await sent.edit_text(
             m.lang["play_duration_limit"].format(config.DURATION_LIMIT // 60)
@@ -93,6 +119,7 @@ async def play_hndlr(
         await utils.play_log(m, sent.link, file.title, file.duration)
 
     file.user = mention
+
     if force:
         current = queue.get_current(m.chat.id)
         if current and current.message_id:
@@ -126,18 +153,37 @@ async def play_hndlr(
             return
 
     if not file.file_path:
-        fname = f"downloads/{file.id}.{'mp4' if video else 'webm'}"
-        if Path(fname).exists():
-            file.file_path = fname
-        else:
-            await sent.edit_text(m.lang["play_downloading"])
-            file.file_path = await yt.download(file.id, video=video)
+        await sent.edit_text(m.lang["play_downloading"])
 
-    await ArchonMusic.play_media(chat_id=m.chat.id, message=sent, media=file)
+        downloaded = await yt.download(
+            file.id,
+            video=video,
+        )
+
+        if not downloaded:
+            return await sent.edit_text(
+                "❌ Download failed. Please try another song."
+            )
+
+        file.file_path = downloaded
+
+    if not Path(file.file_path).exists():
+        return await sent.edit_text(
+            "❌ Downloaded file was not found on the server."
+        )
+
+    await ArchonMusic.play_media(
+        chat_id=m.chat.id,
+        message=sent,
+        media=file,
+    )
+
     if not tracks:
         return
+
     added = playlist_to_queue(m.chat.id, tracks)
     await app.send_message(
         chat_id=m.chat.id,
         text=m.lang["playlist_queued"].format(len(tracks)) + added,
-    )
+            )
+                                    
