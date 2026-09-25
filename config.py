@@ -87,7 +87,7 @@ class Config:
 
         self.PING_IMG = getenv(
             "PING_IMG",
-            "https://files.catbox.moe/yzl72f.jpg"
+            "https://files.catbox.moe/5dc4r1.jpg"
         )
 
         # /start image
@@ -95,7 +95,7 @@ class Config:
         # to use another JPG.
         self.START_IMAGE = getenv(
             "START_IMAGE",
-            "https://files.catbox.moe/voff57.jpg"
+            "https://files.catbox.moe/8dx37s.jpg"
         )
 
         # Bot information
