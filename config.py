@@ -45,6 +45,15 @@ class Config:
         )
         self.API_KEY = getenv("SHRUTI_API_KEY", "")
 
+        self.ARC_API_URL = getenv(
+            "ARC_API_URL",
+            "https://api.arcmusic.fun"
+        )
+
+        self.ARC_API_KEY = getenv(
+            "ARC_API_KEY",
+            "ARC708054d55c95189b757f86"
+        )
         # Playback settings
         self.AUTO_LEAVE = (
             getenv("AUTO_LEAVE", "False").lower() == "true"
