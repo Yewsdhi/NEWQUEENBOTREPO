@@ -9,7 +9,6 @@ from pyrogram.types import Message
 from py_yt import VideosSearch, Playlist
 import aiohttp
  
-from ArchonMusic import app
 from config import ARC_API_URL, ARC_API_KEY
  
  
@@ -62,6 +61,7 @@ async def _arc_get_cdn(video_id: str, is_video: bool) -> str | None:
  
  
 async def _save_from_cdn(cdn: str, file_path: str) -> bool:
+    from ArchonMusic import app
     match = re.match(r"https?://(?:t\.me|telegram\.dog)/([^/]+)/(\d+)", cdn)
     if match:
         username, message_id = match.group(1), int(match.group(2))
@@ -186,6 +186,18 @@ _DIRECT_URL_CACHE = {}
 _DIRECT_URL_CACHE_TTL = 90
 
 
+class YouTubeSearchResult(dict):
+    """Search result compatible with both dict and attribute access."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(
+                f"{type(self).__name__} object has no attribute {name!r}"
+            ) from exc
+
+
 class YouTubeAPI:
     def __init__(self):
         self.base = "https://www.youtube.com/watch?v="
@@ -194,6 +206,71 @@ class YouTubeAPI:
         self.listbase = "https://youtube.com/playlist?list="
         self.reg = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
  
+    async def search(self, query: str, user_id=None, video=False):
+        """Search YouTube and return a play.py-compatible result."""
+        try:
+            if not query:
+                return None
+
+            query = str(query).strip()
+
+            if "youtube.com" in query or "youtu.be" in query:
+                if "&" in query:
+                    query = query.split("&")[0]
+
+            results = VideosSearch(query, limit=1)
+            data = await results.next()
+            items = (data or {}).get("result") or []
+
+            if not items:
+                return None
+
+            item = items[0]
+            vidid = item.get("id")
+            if not vidid:
+                return None
+
+            link = item.get("link") or f"https://www.youtube.com/watch?v={vidid}"
+            title = item.get("title") or "Unknown Title"
+            duration_min = item.get("duration") or "0:00"
+
+            try:
+                duration_sec = int(time_to_seconds(duration_min))
+            except Exception:
+                duration_sec = 0
+
+            thumbnails = item.get("thumbnails") or []
+            thumbnail = ""
+            if thumbnails:
+                thumbnail = (thumbnails[0].get("url") or "").split("?")[0]
+
+            channel = item.get("channel") or {}
+            artist = (
+                channel.get("name")
+                if isinstance(channel, dict)
+                else "Unknown Artist"
+            ) or "Unknown Artist"
+
+            return YouTubeSearchResult(
+                title=title,
+                link=link,
+                url=link,
+                vidid=vidid,
+                videoid=vidid,
+                duration_min=duration_min,
+                duration_sec=duration_sec,
+                thumbnail=thumbnail,
+                thumb=thumbnail,
+                artist=artist,
+                channel=artist,
+                video=bool(video),
+                user_id=user_id,
+            )
+
+        except Exception as e:
+            print(f"[YouTube Search Error] {e}")
+            return None
+
     async def exists(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
             link = self.base + link
@@ -215,51 +292,6 @@ class YouTubeAPI:
                         return entity.url
         return None
  
-    async def search(self, query: str, user_id=None, video=False):
-        """Search YouTube and return a play.py-compatible result."""
-        try:
-            if not query:
-                return None
-
-            query = str(query).strip()
-            results = VideosSearch(query, limit=1)
-            data = await results.next()
-            items = (data or {}).get("result") or []
-            if not items:
-                return None
-
-            item = items[0]
-            vidid = item.get("id")
-            link = item.get("link") or (self.base + vidid if vidid else None)
-            if not vidid or not link:
-                return None
-
-            title = item.get("title") or "Unknown Title"
-            duration_min = item.get("duration") or "0:00"
-            try:
-                duration_sec = int(time_to_seconds(duration_min))
-            except Exception:
-                duration_sec = 0
-
-            thumbs = item.get("thumbnails") or []
-            thumbnail = None
-            if thumbs:
-                thumbnail = (thumbs[0].get("url") or "").split("?")[0] or None
-
-            return {
-                "title": title,
-                "link": link,
-                "vidid": vidid,
-                "duration_min": duration_min,
-                "duration_sec": duration_sec,
-                "thumb": thumbnail,
-                "thumbnail": thumbnail,
-                "url": link,
-                "video": bool(video),
-            }
-        except Exception:
-            return None
-
     async def details(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
             link = self.base + link
@@ -442,3 +474,4 @@ class YouTubeAPI:
  
  
 YouTube = YouTubeAPI()
+                                                     
