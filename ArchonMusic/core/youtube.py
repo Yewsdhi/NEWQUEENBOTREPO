@@ -1,0 +1,573 @@
+import os
+import re
+import asyncio
+import aiohttp
+from pathlib import Path
+from py_yt import VideosSearch, Playlist
+from ArchonMusic import logger, config
+from ArchonMusic.helpers import Track, utils, FallenApi
+
+API_URL = os.environ.get("SHRUTI_API_URL", "https://api01.shrutibots.site").rstrip("/")
+API_URLS = list(dict.fromkeys([
+    API_URL,
+    "https://api01.shrutibots.site",
+    "https://api.shrutibots.site",
+    "https://shrutibots.site",
+]))
+
+API_KEY = os.environ.get("SHRUTI_API_KEY", "ShrutiBotsfhGT4c09sFRRuQIB6yCG") ## Get This API KEY FROM TELEGRAM BOT USERNAME: @SHRUTIAPIBOT
+
+DOWNLOAD_DIR = "downloads"
+
+
+def _youtube_id(value: str) -> str:
+    """Return a clean YouTube video id from an id or common YouTube URL."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    patterns = (
+        r"(?:v=|vi=)([A-Za-z0-9_-]{6,})",
+        r"youtu\.be/([A-Za-z0-9_-]{6,})",
+        r"youtube\.com/shorts/([A-Za-z0-9_-]{6,})",
+        r"youtube\.com/embed/([A-Za-z0-9_-]{6,})",
+        r"youtube\.com/live/([A-Za-z0-9_-]{6,})",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, value)
+        if m:
+            return m.group(1)
+    return value if re.fullmatch(r"[A-Za-z0-9_-]{6,}", value) else ""
+
+
+async def _download_from_api(video_id: str, media_type: str, timeout: int) -> str | None:
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    ext = "mp4" if media_type == "video" else "mp3"
+    file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.{ext}")
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+        return file_path
+
+    for api_url in API_URLS:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{api_url}/download",
+                    params={"url": video_id, "type": media_type, "api_key": API_KEY},
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    with open(file_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(131072):
+                            if chunk:
+                                f.write(chunk)
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                return file_path
+        except Exception as e:
+            logger.warning(f"[YouTube.API] {api_url} {media_type} failed for {video_id}: {e!r}")
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+    return None
+
+
+async def download_song(link: str) -> str:
+    return await _download_from_api(_youtube_id(link), "audio", 300) if _youtube_id(link) else None
+
+
+async def download_video(link: str) -> str:
+    return await _download_from_api(_youtube_id(link), "video", 600) if _youtube_id(link) else None
+
+
+class YouTube:
+    def __init__(self):
+        self.base = "https://www.youtube.com/watch?v="
+        self.regex = re.compile(
+            r"(https?://)?(www\.|m\.|music\.)?"
+            r"(youtube\.com/(watch\?v=|shorts/|playlist\?list=)|youtu\.be/)"
+            r"([A-Za-z0-9_-]{11}|PL[A-Za-z0-9_-]+)([&?][^\s]*)?"
+        )
+        self.cookie_dir = "AloneX/cookies"
+        self.fallen_api = FallenApi(API_URL, API_KEY, retries=2, timeout=30)
+
+    def valid(self, url: str) -> bool:
+        return bool(re.match(self.regex, url))
+
+    async def search(self, query: str, m_id: int, video: bool = False) -> Track | None:
+        try:
+            video_id = _youtube_id(query) if self.valid(query) else ""
+            if video_id:
+                # Direct URL: never ask yt-dlp/YouTube for metadata.
+                # YouTube can block cloud IPs with an anti-bot challenge even
+                # before media download. oEmbed is metadata-only and needs no
+                # cookies; if it is unavailable we still keep the supplied ID
+                # and let the download API handle the media.
+                data = {}
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            "https://www.youtube.com/oembed",
+                            params={
+                                "url": f"https://www.youtube.com/watch?v={video_id}",
+                                "format": "json",
+                            },
+                            timeout=aiohttp.ClientTimeout(total=8),
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.json(content_type=None)
+                except Exception as e:
+                    logger.warning(f"[YouTube.oEmbed] metadata unavailable for {video_id}: {e!r}")
+
+                duration_sec = 0
+                duration_text = None
+                thumb = data.get("thumbnail_url") or None
+                channel = data.get("author_name") or "YouTube"
+                title = data.get("title") or ""
+
+                # oEmbed has no duration. Use the same VideosSearch backend
+                # used by normal /play searches to fill missing metadata.
+                try:
+                    _meta_search = VideosSearch(
+                        f"https://www.youtube.com/watch?v={video_id}",
+                        limit=1,
+                    )
+                    _meta = await _meta_search.next()
+                    _items = (_meta or {}).get("result") or []
+                    if _items:
+                        item = _items[0] or {}
+                        title = item.get("title") or title
+                        duration_text = item.get("duration") or duration_text
+                        ch = item.get("channel") or {}
+                        if isinstance(ch, dict):
+                            channel = ch.get("name") or channel
+                        thumbs = item.get("thumbnails") or []
+                        if thumbs:
+                            thumb = (thumbs[-1].get("url") or "").split("?", 1)[0] or thumb
+                except Exception as e:
+                    logger.warning(f"[YouTube.SearchMetadata] {video_id}: {e!r}")
+
+                if duration_text:
+                    duration_sec = utils.to_seconds(duration_text)
+                if not duration_text:
+                    duration_text = self._format_duration(duration_sec)
+                if not title:
+                    title = f"YouTube {video_id}"
+
+                track = Track(
+                    id=video_id, channel_name=channel, duration=duration_text,
+                    duration_sec=duration_sec, message_id=m_id, title=title, thumbnail=thumb,
+                    url=f"https://www.youtube.com/watch?v={video_id}",
+                    view_count=str(data.get("view_count") or ""), video=video,
+                )
+                track.language = self._language_key(title, channel)
+                return track
+
+            _search = VideosSearch(query, limit=1)
+            results = await _search.next()
+            if results and results.get("result"):
+                data = results["result"][0] or {}
+                channel = data.get("channel") or {}
+                thumbnails = data.get("thumbnails") or []
+                thumb_url = ((thumbnails[-1] or {}).get("url") or "").split("?", 1)[0] if thumbnails else ""
+                detected_language = self._language_key(data.get("title", ""), channel.get("name", ""))
+                if detected_language == "unknown":
+                    detected_language = self._language_key(query, "")
+                track = Track(
+                    id=data.get("id"), channel_name=channel.get("name") or "YouTube",
+                    duration=data.get("duration") or "0:00", duration_sec=utils.to_seconds(data.get("duration")) if data.get("duration") else 0,
+                    message_id=m_id, title=data.get("title") or query, thumbnail=thumb_url or None,
+                    url=(data.get("link") or "").split("&list=")[0],
+                    view_count=(data.get("viewCount") or {}).get("short") if isinstance(data.get("viewCount"), dict) else str(data.get("viewCount") or ""),
+                    video=video,
+                )
+                track.language = detected_language
+                return track
+        except Exception as e:
+            logger.error(f"Search error: {e}")
+        return None
+
+    async def playlist(self, limit: int, user: str, url: str, video: bool) -> list[Track]:
+        tracks = []
+        try:
+            plist = await Playlist.get(url)
+            for data in plist.get("videos", [])[:limit]:
+                duration_text = data.get("duration") or "0:00"
+                thumbs = data.get("thumbnails") or []
+                thumb_url = ((thumbs[-1] or {}).get("url") or "").split("?", 1)[0] if thumbs else ""
+                raw_link = data.get("link") or f"https://www.youtube.com/watch?v={data.get('id')}"
+                track = Track(
+                    id=data.get("id"),
+                    channel_name=data.get("channel", {}).get("name", ""),
+                    duration=duration_text,
+                    duration_sec=utils.to_seconds(duration_text),
+                    title=data.get("title") or "Unknown Title",
+                    thumbnail=thumb_url or None,
+                    url=raw_link.split("&list=")[0],
+                    user=user,
+                    view_count="",
+                    video=video,
+                )
+                track.language = self._language_key(data.get("title", ""), data.get("channel", {}).get("name", ""))
+                tracks.append(track)
+        except Exception as e:
+            logger.error(f"Playlist error: {e}")
+        return tracks
+
+    async def stream_url(self, video_id: str, video: bool = False) -> str | None:
+        """Return a remote CDN URL for direct PyTgCalls playback.
+
+        This avoids downloading the complete song to disk before playback.
+        If the API does not expose a usable CDN URL, the caller can fall back
+        to the normal local download path.
+        """
+        video_id = _youtube_id(video_id)
+        if not video_id or video:
+            return None
+        try:
+            track = await self.fallen_api.get_track(
+                f"https://www.youtube.com/watch?v={video_id}"
+            )
+            cdn = getattr(track, "cdnurl", None) if track else None
+            if cdn and str(cdn).startswith(("http://", "https://")):
+                return cdn
+        except Exception as e:
+            logger.warning(
+                f"[YouTube.stream_url] direct stream failed for {video_id}: {e!r}"
+            )
+        return None
+
+    async def download(self, video_id: str, video: bool = False) -> str | None:
+        """Download media with two API paths; never use cookies.
+
+        Some API responses can be HTTP 200 without returning a usable file.
+        In that case fall back to the /api/track -> CDN/Telegram path.
+        """
+        video_id = _youtube_id(video_id)
+        if not video_id:
+            return None
+
+        # Primary downloader.
+        path = await (download_video(video_id) if video else download_song(video_id))
+        if path and os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+
+        # Secondary API fallback. Some hosted API endpoints return 404;
+        # keep trying but never let that prevent the local extractor fallback.
+        try:
+            path = await self.fallen_api.download_track(video_id, video=video)
+            if path and os.path.exists(path) and os.path.getsize(path) > 0:
+                return path
+        except Exception as e:
+            logger.warning(f"[YouTube.download] API fallback failed for {video_id}: {e!r}")
+
+        # Do not fall back to direct yt-dlp. On Heroku/Salesforce cloud IPs
+        # YouTube may return an anti-bot challenge; retrying with other player
+        # clients does not solve that reliably and would only spam the logs.
+        return None
+
+    def _format_duration(self, seconds: int) -> str:
+        seconds = max(int(seconds or 0), 0)
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m}:{s:02d}"
+
+    def _format_views(self, count) -> str:
+        if not count:
+            return ""
+        count = int(count)
+        if count >= 1_000_000:
+            return f"{count / 1_000_000:.1f}M views"
+        if count >= 1_000:
+            return f"{count / 1_000:.1f}K views"
+        return f"{count} views"
+
+    def _extract_related(self, video_id: str) -> dict | None:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": "in_playlist",
+            "skip_download": True,
+            "ignoreerrors": True,
+            "geo_bypass": True,
+            "socket_timeout": 10,
+            "retries": 1,
+            "extractor_retries": 1,
+            "extractor_args": {"youtube": {"player_client": ["android"]}},
+        }
+        url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    @staticmethod
+    def _is_non_music_title(title: str) -> bool:
+        """Reject podcast/episode/talk content from autoplay."""
+        t = (title or "").lower()
+        blocked = (
+            "episode", "podcast", "interview", "news", "talk show",
+            "full show", "full episode", "web series", "webseries",
+            "documentary", "trailer", "teaser", "reaction", "reaction video", "behind the scenes", "behind-the-scenes",
+        )
+        return any(word in t for word in blocked)
+
+    @staticmethod
+    def _language_key(title: str, channel: str = "") -> str:
+        """Classify autoplay language from title/channel without needing cookies.
+        Bhojpuri is checked before Hindi because both commonly use Devanagari.
+        """
+        t = f"{title or ''} {channel or ''}".lower()
+        if re.search(r"[\u0a00-\u0a7f]", t) or any(k in t for k in (
+            "punjabi", "panjabi", "bhangra", "gurmukhi", "punjabi song", "punjabi songs", "punjabi music",
+        )):
+            return "punjabi"
+        if any(k in t for k in (
+            "bhojpuri", "bhojpuriya", "bhojpuri song", "bhojpuri songs",
+            "purvanchal", "nirahua", "dinesh lal yadav", "khesari",
+            "khesari lal", "pawan singh", "rakesh mishra", "pramod premi",
+            "shilpi raj", "ritesh pandey", "ankush raja", "samar singh",
+            "neelkamal singh", "arvind akela kallu", "gunjan singh",
+            "priyanka singh", "kalpana", "chhotu chhaliya", "vikas jha",
+            "alok raj", "ashish yadav", "tuntun yadav", "raj bhai",
+            "aadishakti films", "wave music", "saregama hum bhojpuri",
+            "t-series hamaarbhojpuri", "hamaarbhojpuri", "enter10 music bhojpuri",
+            "bhojpuri hit", "bhojpuri lokgeet", "bhojpuri lok geet",
+            "bhojpuri dj", "bhojpuri status", "bhojpuri vivah", "bhojpuri vivah geet",
+            "golu gold", "rajesh khushdil", "vikas bedardi", "arjun rasiya",
+        )):
+            return "bhojpuri"
+        # Common Bhojpuri vocabulary is often present even when YouTube
+        # omits the word "Bhojpuri" from the title. Keep it out of Hindi.
+        bhojpuri_words = (
+            "गवनवा", "सईयां", "सईयाँ", "सइयां", "सइयाँ", "बलमुआ",
+            "बलमा", "पिया जी", "पियवा", "भतार", "लईका", "लइका",
+            "करेजा", "रउआ", "तोहरा", "हमरा", "हमार", "तोहार",
+            "बाड़े", "बानी", "बाड़ू", "बाड़ू", "निरहुआ", "खेसारी",
+            "पवन सिंह", "शिल्पी राज", "रउरा", "रउआ के", "हमनी", "तोहसे",
+            "तोहरा बिना", "हमरा बिना", "सईया", "सईयाँ", "बलम", "बबुआ",
+            "लइकी", "लईकी", "चोली", "साड़ी", "सजनी",
+        )
+        if any(k in t for k in bhojpuri_words):
+            return "bhojpuri"
+        # Devanagari without Bhojpuri markers is treated as Hindi.
+        if re.search(r"[\u0900-\u097f]", t) or any(k in t for k in (
+            "hindi", "bollywood", "hindustani", "hindi song", "hindi songs", "hindi music", "bollywood songs",
+            "t-series", "saregama music", "tips official", "zee music company",
+            "sony music india", "speed records", "punjabi song", "punjabi songs",
+        )):
+            return "hindi"
+        return "unknown"
+
+    @staticmethod
+    def _movie_key(title: str) -> str:
+        """Get a lightweight movie/source key from common YouTube song titles."""
+        t = re.sub(r"\s+", " ", (title or "").lower()).strip()
+        # Common formats: Song - Movie, Song | Movie, Song (Movie).
+        parts = re.split(r"\s+[|–—-]\s+|\s*\|\s*", t)
+        if len(parts) > 1:
+            candidate = parts[-1].strip()
+        else:
+            m = re.search(r"\bfrom\s+(.+)$", t)
+            candidate = m.group(1).strip() if m else ""
+            if not candidate:
+                m = re.search(r"\(([^()]*)\)\s*$", t)
+                candidate = m.group(1).strip() if m else ""
+        candidate = re.sub(r"[^a-z0-9 ]+", " ", candidate)
+        candidate = re.sub(r"\b(official|video|audio|song|lyrics|lyric|hd|4k)\b", " ", candidate)
+        return re.sub(r"\s+", " ", candidate).strip()
+
+    async def _related_from_mix(
+        self, video_id: str, played: set[str], movie_history: set[str] | None = None,
+        language: str = "unknown"
+    ) -> Track | None:
+        loop = asyncio.get_event_loop()
+        try:
+            info = await asyncio.wait_for(
+                loop.run_in_executor(None, self._extract_related, video_id),
+                timeout=20,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[Autoplay] Mix fetch timed out for {video_id}.")
+            return None
+        except Exception as e:
+            logger.error(f"[Autoplay] Mix fetch failed for {video_id}: {e}")
+            return None
+
+        entries = (info or {}).get("entries") or []
+        for entry in entries:
+            if not entry:
+                continue
+
+            eid = entry.get("id")
+            if not eid or eid in played:
+                continue
+
+            title = entry.get("title") or "Unknown"
+            if title.lower() in ("[deleted video]", "[private video]"):
+                continue
+            if self._is_non_music_title(title):
+                continue
+            candidate_language = self._language_key(title, entry.get("channel") or entry.get("uploader") or "")
+            if language != "unknown" and candidate_language != language:
+                continue
+            movie_key = self._movie_key(title)
+            if movie_key and movie_history and movie_key in movie_history:
+                continue
+
+            duration = int(entry.get("duration") or 0)
+            if duration <= 0 or duration > config.DURATION_LIMIT:
+                continue
+
+            thumbs = entry.get("thumbnails") or []
+            thumbnail = thumbs[-1]["url"].split("?")[0] if thumbs else None
+
+            track = Track(
+                id=eid,
+                channel_name=entry.get("channel") or entry.get("uploader") or "YouTube",
+                duration=self._format_duration(duration),
+                duration_sec=duration,
+                title=title,
+                thumbnail=thumbnail,
+                url=f"https://www.youtube.com/watch?v={eid}",
+                view_count=self._format_views(entry.get("view_count")),
+                video=False,
+            )
+            track.language = candidate_language
+            return track
+
+        return None
+
+    async def _related_from_search(
+        self, current: Track, played: set[str], movie_history: set[str] | None = None,
+        language: str = "unknown"
+    ) -> Track | None:
+        """Fallback used when YouTube blocks the mix-playlist scrape (common on
+        server/cloud IPs without cookies). Reuses the same search backend that
+        already powers /play, so it works wherever normal search works."""
+        # A direct YouTube link can arrive without a language label. In that
+        # case infer it once from the current title/channel before searching.
+        if language == "unknown":
+            language = self._language_key(
+                getattr(current, "title", ""), getattr(current, "channel_name", "")
+            )
+        language_hint = {
+            "hindi": "Hindi Bollywood songs old new",
+            "bhojpuri": "Bhojpuri songs old new",
+            "punjabi": "Punjabi songs old new",
+        }.get(language, "songs")
+        queries = []
+        if current.channel_name:
+            # Keep the language locked even when YouTube search returns mixed results.
+            queries.append(f"{current.channel_name} {language_hint} official song")
+            queries.append(f"{current.channel_name} {language_hint}")
+        if current.title:
+            queries.append(f"{current.title} {language_hint}")
+        # Always include a language-only pool so old/new songs are not limited
+        # to the current artist/channel. Candidate language is still checked below.
+        queries.append(language_hint)
+        if language == "hindi":
+            queries.append("Hindi songs 90s 2000s 2010s latest Bollywood")
+        elif language == "bhojpuri":
+            queries.append("Bhojpuri old new hit songs")
+        elif language == "punjabi":
+            queries.append("Punjabi old new hit songs")
+
+        for query in queries:
+            try:
+                _search = VideosSearch(query, limit=8)
+                results = await _search.next()
+            except Exception as e:
+                logger.error(f"[Autoplay] Search fallback failed for {query!r}: {e}")
+                continue
+
+            for data in (results or {}).get("result", []):
+                eid = data.get("id")
+                if not eid or eid in played:
+                    continue
+
+                title = data.get("title") or "Unknown"
+                if self._is_non_music_title(title):
+                    continue
+                candidate_channel = data.get("channel", {}).get("name") or ""
+                candidate_language = self._language_key(title, candidate_channel)
+                if language != "unknown" and candidate_language != language:
+                    continue
+                movie_key = self._movie_key(title)
+                if movie_key and movie_history and movie_key in movie_history:
+                    continue
+
+                duration_str = data.get("duration")
+                duration_sec = utils.to_seconds(duration_str) if duration_str else 0
+                if not duration_sec or duration_sec > config.DURATION_LIMIT:
+                    continue
+
+                track = Track(
+                    id=eid,
+                    channel_name=data.get("channel", {}).get("name") or "YouTube",
+                    duration=duration_str,
+                    duration_sec=duration_sec,
+                    title=title,
+                    thumbnail=(data.get("thumbnails", [{}])[-1].get("url") or "").split("?")[0] or None,
+                    url=data.get("link"),
+                    view_count=(data.get("viewCount") or {}).get("short") if isinstance(data.get("viewCount"), dict) else str(data.get("viewCount") or ""),
+                    video=False,
+                )
+                track.language = candidate_language
+                return track
+
+        return None
+
+    async def get_related(
+        self, current: Track, played: list[str] | None = None,
+        movie_history: list[str] | None = None
+    ) -> Track | None:
+        """Fetch the next autoplay track, skipping anything already played in
+        this session. Tries YouTube's related mix first, falling back to a
+        text search (same backend as /play) if the mix is blocked or empty —
+        this is common on server/cloud IPs without YouTube cookies set."""
+        if not current or not current.id:
+            return None
+
+        played = set(played or [])
+        played.add(current.id)
+        movie_history = set(movie_history or [])
+        current_language = getattr(current, "language", "unknown") or self._language_key(
+            getattr(current, "title", ""), getattr(current, "channel_name", "")
+        )
+        current_movie = self._movie_key(getattr(current, "title", ""))
+        if current_movie:
+            movie_history.add(current_movie)
+
+        # Run the two lightweight discovery paths in parallel. On cloud IPs,
+        # YouTube's RD mix can be slow/blocked while VideosSearch is often
+        # available immediately. Whichever produces a valid unused track first
+        # wins, reducing the pause between songs.
+        mix_task = asyncio.create_task(
+            self._related_from_mix(current.id, played, movie_history, current_language)
+        )
+        search_task = asyncio.create_task(
+            self._related_from_search(current, played, movie_history, current_language)
+        )
+        try:
+            pending = {mix_task, search_task}
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    try:
+                        related = task.result()
+                    except Exception as e:
+                        logger.warning(f"[Autoplay] related lookup failed: {e!r}")
+                        related = None
+                    if related:
+                        for other in pending:
+                            other.cancel()
+                        return related
+            logger.warning(f"[Autoplay] No related track found for {current.id}.")
+            return None
+        finally:
+            for task in (mix_task, search_task):
+                if not task.done():
+                    task.cancel()
