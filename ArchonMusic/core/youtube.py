@@ -215,6 +215,51 @@ class YouTubeAPI:
                         return entity.url
         return None
  
+    async def search(self, query: str, user_id=None, video=False):
+        """Search YouTube and return a play.py-compatible result."""
+        try:
+            if not query:
+                return None
+
+            query = str(query).strip()
+            results = VideosSearch(query, limit=1)
+            data = await results.next()
+            items = (data or {}).get("result") or []
+            if not items:
+                return None
+
+            item = items[0]
+            vidid = item.get("id")
+            link = item.get("link") or (self.base + vidid if vidid else None)
+            if not vidid or not link:
+                return None
+
+            title = item.get("title") or "Unknown Title"
+            duration_min = item.get("duration") or "0:00"
+            try:
+                duration_sec = int(time_to_seconds(duration_min))
+            except Exception:
+                duration_sec = 0
+
+            thumbs = item.get("thumbnails") or []
+            thumbnail = None
+            if thumbs:
+                thumbnail = (thumbs[0].get("url") or "").split("?")[0] or None
+
+            return {
+                "title": title,
+                "link": link,
+                "vidid": vidid,
+                "duration_min": duration_min,
+                "duration_sec": duration_sec,
+                "thumb": thumbnail,
+                "thumbnail": thumbnail,
+                "url": link,
+                "video": bool(video),
+            }
+        except Exception:
+            return None
+
     async def details(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
             link = self.base + link
