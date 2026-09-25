@@ -333,33 +333,22 @@ class TgCall(PyTgCalls):
         return track
 
     async def _prepare_track(self, track) -> None:
-        """Prepare a queued track, preferring direct CDN streaming."""
+        """Resolve/download the next track before it is needed."""
         if not track or track.file_path:
             return
         try:
-            if not getattr(track, "video", False):
-                try:
-                    track.file_path = await yt.stream_url(track.id, video=False)
-                except Exception as e:
-                    logger.warning(
-                        f"[_prepare_track] direct stream lookup failed for {track.id}: {e!r}"
-                    )
-
-            if not track.file_path:
-                track.file_path = await yt.download(
-                    track.id, video=getattr(track, "video", False)
-                )
-
+            # The configured download API returns a complete local media file.
+            # Downloading it in the background is much faster at song-boundary
+            # time than starting a fresh download after StreamEnded.
+            track.file_path = await yt.download(track.id, video=track.video)
             if not track.file_path:
                 logger.warning(
-                    f"[_prepare_track] no playable media returned for {track.id}"
+                    f"[_prepare_track] media download returned no file for {track.id}"
                 )
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.warning(
-                f"[_prepare_track] failed for {getattr(track, 'id', '?')}: {e!r}"
-            )
+            logger.warning(f"[_prepare_track] failed for {getattr(track, 'id', '?')}: {e!r}")
 
     async def _prepare_autoplay(self, chat_id: int, finished) -> None:
         """Find and download an autoplay track while the current track plays."""
