@@ -6,10 +6,10 @@ from typing import Union
 import yt_dlp
 from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
-from py_yt import VideosSearch
+from py_yt import VideosSearch, Playlist
 import aiohttp
  
-from ShiviMusic import app
+from ArchonMusic import app
 from config import ARC_API_URL, ARC_API_KEY
  
  
