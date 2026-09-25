@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import aiohttp
+import yt_dlp
 from pathlib import Path
 from py_yt import VideosSearch, Playlist
 from ArchonMusic import logger, config
@@ -119,15 +120,93 @@ class YouTube:
                 except Exception as e:
                     logger.warning(f"[YouTube.oEmbed] metadata unavailable for {video_id}: {e!r}")
 
+                # oEmbed does not provide duration. Fetch richer metadata
+                # with py_yt first, then use yt-dlp metadata-only as a fallback.
                 duration_sec = 0
+                duration_text = None
                 thumb = data.get("thumbnail_url") or None
                 channel = data.get("author_name") or "YouTube"
-                title = data.get("title") or f"YouTube {video_id}"
+                title = data.get("title") or ""
+
+                try:
+                    meta_search = VideosSearch(
+                        f"https://www.youtube.com/watch?v={video_id}",
+                        limit=1,
+                    )
+                    meta_result = await meta_search.next()
+                    meta_items = (meta_result or {}).get("result") or []
+                    if meta_items:
+                        meta = meta_items[0] or {}
+                        title = meta.get("title") or title
+                        duration_text = meta.get("duration") or duration_text
+                        channel_data = meta.get("channel") or {}
+                        if isinstance(channel_data, dict):
+                            channel = channel_data.get("name") or channel
+                        thumbs = meta.get("thumbnails") or []
+                        if thumbs:
+                            thumb = (thumbs[-1].get("url") or "").split("?", 1)[0] or thumb
+                except Exception as e:
+                    logger.warning(
+                        f"[YouTube.SearchMetadata] py_yt failed for {video_id}: {e!r}"
+                    )
+
+                if not duration_text or not title:
+                    def _metadata_fallback():
+                        opts = {
+                            "quiet": True,
+                            "no_warnings": True,
+                            "skip_download": True,
+                            "noplaylist": True,
+                            "socket_timeout": 8,
+                            "retries": 1,
+                            "extractor_retries": 1,
+                        }
+                        with yt_dlp.YoutubeDL(opts) as ydl:
+                            return ydl.extract_info(
+                                f"https://www.youtube.com/watch?v={video_id}",
+                                download=False,
+                            )
+
+                    try:
+                        meta = await asyncio.to_thread(_metadata_fallback)
+                        if meta:
+                            title = meta.get("title") or title
+                            duration_sec = int(meta.get("duration") or 0)
+                            duration_text = (
+                                self._format_duration(duration_sec)
+                                if duration_sec
+                                else duration_text
+                            )
+                            channel = (
+                                meta.get("channel")
+                                or meta.get("uploader")
+                                or channel
+                            )
+                            thumb = meta.get("thumbnail") or thumb
+                    except Exception as e:
+                        logger.warning(
+                            f"[YouTube.SearchMetadata] yt-dlp fallback failed for {video_id}: {e!r}"
+                        )
+
+                if duration_text and not duration_sec:
+                    duration_sec = utils.to_seconds(duration_text)
+
+                if not duration_text:
+                    duration_text = self._format_duration(duration_sec)
+
+                title = title or f"YouTube {video_id}"
+
                 track = Track(
-                    id=video_id, channel_name=channel, duration=self._format_duration(duration_sec),
-                    duration_sec=duration_sec, message_id=m_id, title=title, thumbnail=thumb,
+                    id=video_id,
+                    channel_name=channel,
+                    duration=duration_text,
+                    duration_sec=duration_sec,
+                    message_id=m_id,
+                    title=title,
+                    thumbnail=thumb,
                     url=f"https://www.youtube.com/watch?v={video_id}",
-                    view_count=str(data.get("view_count") or ""), video=video,
+                    view_count=str(data.get("view_count") or ""),
+                    video=video,
                 )
                 track.language = self._language_key(title, channel)
                 return track
@@ -142,10 +221,12 @@ class YouTube:
                 detected_language = self._language_key(data.get("title", ""), channel.get("name", ""))
                 if detected_language == "unknown":
                     detected_language = self._language_key(query, "")
+                duration_text = data.get("duration") or "0:00"
+                duration_sec = utils.to_seconds(duration_text) if duration_text else 0
                 track = Track(
                     id=data.get("id"), channel_name=channel.get("name") or "YouTube",
-                    duration=data.get("duration"), duration_sec=utils.to_seconds(data.get("duration")) if data.get("duration") else 0,
-                    message_id=m_id, title=data.get("title"), thumbnail=thumb_url or None,
+                    duration=duration_text, duration_sec=duration_sec,
+                    message_id=m_id, title=data.get("title") or query, thumbnail=thumb_url or None,
                     url=(data.get("link") or "").split("&list=")[0],
                     view_count=(data.get("viewCount") or {}).get("short") if isinstance(data.get("viewCount"), dict) else str(data.get("viewCount") or ""),
                     video=video,
@@ -161,14 +242,23 @@ class YouTube:
         try:
             plist = await Playlist.get(url)
             for data in plist.get("videos", [])[:limit]:
+                duration_text = data.get("duration") or "0:00"
+                thumbs = data.get("thumbnails") or []
+                thumb_url = (
+                    (thumbs[-1].get("url") or "").split("?", 1)[0]
+                    if thumbs else ""
+                )
+                raw_link = data.get("link") or (
+                    f"https://www.youtube.com/watch?v={data.get('id')}"
+                )
                 track = Track(
                     id=data.get("id"),
                     channel_name=data.get("channel", {}).get("name", ""),
-                    duration=data.get("duration"),
-                    duration_sec=utils.to_seconds(data.get("duration")) if data.get("duration") else 0,
-                    title=data.get("title"),
+                    duration=duration_text,
+                    duration_sec=utils.to_seconds(duration_text),
+                    title=data.get("title") or "Unknown Title",
                     thumbnail=thumb_url or None,
-                    url=data.get("link").split("&list=")[0],
+                    url=raw_link.split("&list=")[0],
                     user=user,
                     view_count="",
                     video=video,
