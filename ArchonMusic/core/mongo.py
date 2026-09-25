@@ -12,7 +12,7 @@ class MongoDB:
         Initialize the MongoDB connection.
         """
         self.mongo = AsyncMongoClient(config.MONGO_URL, serverSelectionTimeoutMS=12500)
-        self.db = self.mongo.TGN
+        self.db = self.mongo..
 
         self.admin_list = {}
         self.active_calls = {}
